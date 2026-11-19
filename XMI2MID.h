@@ -3,15 +3,24 @@
 // XMI2MID07 Utility by Darkcrafter07
 // License: MIT. I do NOT take any responsibility for any potential damage.
 //
-// Description:
-//   Modular ANSI C header for bidirectional MIDI <-> XMIDI conversion and
-//   exact byte-size slicing. Compatible with MSVC 2017 (v140_xp) and GCC/Clang.
+// Architecture:
+//   1. Sorting & Binary Encoding Helpers (VLQ, XMI Delay, Path Builders)
+//   2. Shared Synthesizer Channel State Tracker (used by both slicers)
+//   3. File Writers (Standard MIDI & IFF XMIDI containers)
+//   4. XMI -> MIDI Pipeline (IFF Parser -> 60PPQN Decoder -> Single/Sliced Writer)
+//   5. MIDI -> XMI Pipeline (MTrk Merger -> DDA 120Hz Quantizer -> Note Pairer -> Writer)
+//   6. Directory Scanning & File I/O Helpers
+//   7. File Merging Engine (-merge & -mergename for batch/explicit concatenation)
+//   8. CLI Argument Parser & Main Entry Point
 //
-// Uses John Miles MIDIFORM DDA quantization logic + SMPTE fix + -slim mode
-// Fixes overlapping notes when converting from XMI to MIDI.
-// Splits files preserving pitch, just add -slice 32000 or any amount of bytes.
-// Can convert MIDI to XMI, as well as XMI to MIDI.
-//
+// Features:
+//   - Bidirectional conversion between Standard MIDI (.mid) and XMIDI (.xmi)
+//   - John Miles MIDIFORM DDA 120Hz quantization logic + legacy SMPTE fix
+//   - Overlapping note detector during XMI -> MIDI decoding
+//   - Slim mode (-slim): strips Aftertouch & duplicate CCs while keeping Pitch Bend
+//   - Exact byte-size slicing (-slice <bytes>) preserving instruments, volume, pan,
+//     tempo, Pitch Bend, and Pitch Bend Sensitivity (RPN 0,0) across slice boundaries
+//   - Seamless file merging (-merge / -mergename) for both .mid and .xmi files
 //==============================================================================
 
 #ifndef XMI2MID_H
@@ -120,6 +129,30 @@ void convert_mid_to_xmi
     int slim_mode,
     unsigned int quant_hz,
     unsigned int slice_max_bytes
+);
+
+//------------------------------------------------------------------------------
+// Merge Mode Constants & API
+//------------------------------------------------------------------------------
+#define MAX_MERGE_FILES     256         // Maximum files in a single merge batch
+
+// Merges an explicit list of MIDI/XMI files into a single output file
+void merge_files_list
+(
+	const char **file_list,
+	int file_count,
+	const char *out_filename,
+	int slim_mode,
+	unsigned int quant_hz
+);
+
+// Scans current directory and merges files matching root prefix (or all groups if root == NULL)
+void merge_directory_by_root
+(
+	const char *root_prefix,
+	const char *out_filename,
+	int slim_mode,
+	unsigned int quant_hz
 );
 
 #endif // XMI2MID_H

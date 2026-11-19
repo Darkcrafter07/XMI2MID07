@@ -9,13 +9,18 @@
 //   3. File Writers (Standard MIDI & IFF XMIDI containers)
 //   4. XMI -> MIDI Pipeline (IFF Parser -> 60PPQN Decoder -> Single/Sliced Writer)
 //   5. MIDI -> XMI Pipeline (MTrk Merger -> DDA 120Hz Quantizer -> Note Pairer -> Writer)
-//   6. CLI Argument Parser & Entry Point
+//   6. Directory Scanning & File I/O Helpers
+//   7. File Merging Engine (-merge & -mergename for batch/explicit concatenation)
+//   8. CLI Argument Parser & Main Entry Point
 //
-// Uses John Miles MIDIFORM DDA quantization logic + SMPTE fix + -slim mode
-// Fixes overlapping notes when converting from XMI to MIDI.
-// Splits files preserving pitch, just add -slice 32000 or any amount of bytes.
-// Can convert MIDI to XMI, as well as XMI to MIDI.
-//
+// Features:
+//   - Bidirectional conversion between Standard MIDI (.mid) and XMIDI (.xmi)
+//   - John Miles MIDIFORM DDA 120Hz quantization logic + legacy SMPTE fix
+//   - Overlapping note detector during XMI -> MIDI decoding
+//   - Slim mode (-slim): strips Aftertouch & duplicate CCs while keeping Pitch Bend
+//   - Exact byte-size slicing (-slice <bytes>) preserving instruments, volume, pan,
+//     tempo, Pitch Bend, and Pitch Bend Sensitivity (RPN 0,0) across slice boundaries
+//   - Seamless file merging (-merge / -mergename) for both .mid and .xmi files
 //==============================================================================
 
 #include "XMI2MID.h"
@@ -1629,7 +1634,587 @@ void convert_mid_to_xmi(unsigned char *midi_data, long fsize, const char *in_fil
 }
 
 //==============================================================================
-// 6. CLI Argument Parser & Main Entry Point
+// 7. File Merging Engine (-merge & -mergename)
+//==============================================================================
+
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <dirent.h>
+#endif
+
+// Comparator for sorting filenames alphabetically/numerically (_01, _02, ...)
+static int comp_filenames(const void *pa, const void *pb)
+{
+	const char *sa = *(const char * const *)pa;
+	const char *sb = *(const char * const *)pb;
+	return _stricmp(sa, sb);
+}
+
+// Extracts root name before "_XX" suffix (e.g. "e1l4_01.xmi" -> "e1l4")
+// Returns 1 if file matches "<root>_<digits>.<ext>" pattern, 0 otherwise
+static int extract_slice_root(const char *filename, char *root_out, size_t root_sz, char *ext_out, size_t ext_sz)
+{
+	const char *dot = strrchr(filename, '.');
+	const char *underscore = NULL;
+	size_t name_len, root_len, k;
+	const char *p;
+
+	if (!dot)
+	{
+		return 0;
+	}
+	if (_stricmp(dot, ".mid") != 0 && _stricmp(dot, ".xmi") != 0)
+	{
+		return 0;
+	}
+
+	strncpy(ext_out, dot, ext_sz - 1);
+	ext_out[ext_sz - 1] = '\0';
+
+	name_len = (size_t)(dot - filename);
+	for (k = 0; k < name_len; k++)
+	{
+		if (filename[k] == '_')
+		{
+			underscore = filename + k;
+		}
+	}
+
+	if (!underscore || underscore == filename)
+	{
+		return 0;
+	}
+
+	// Verify all characters between '_' and '.' are ASCII digits '0'..'9'
+	p = underscore + 1;
+	if (p >= dot)
+	{
+		return 0;
+	}
+	while (p < dot)
+	{
+		if (*p < '0' || *p > '9')
+		{
+			return 0;
+		}
+		p++;
+	}
+
+	root_len = (size_t)(underscore - filename);
+	if (root_len >= root_sz)
+	{
+		root_len = root_sz - 1;
+	}
+	memcpy(root_out, filename, root_len);
+	root_out[root_len] = '\0';
+
+	return 1;
+}
+
+// Checks if filename matches explicit root prefix (e.g. "e1l4*") and isn't already "_merged"
+static int matches_explicit_root(const char *filename, const char *root_prefix, char *ext_out, size_t ext_sz)
+{
+	const char *dot = strrchr(filename, '.');
+	size_t prefix_len = strlen(root_prefix);
+
+	if (!dot)
+	{
+		return 0;
+	}
+	if (_stricmp(dot, ".mid") != 0 && _stricmp(dot, ".xmi") != 0)
+	{
+		return 0;
+	}
+	if (_strnicmp(filename, root_prefix, prefix_len) != 0)
+	{
+		return 0;
+	}
+	// Skip exact base file (e.g. "e1l4.mid") and already merged output ("e1l4_merged.mid")
+	if ((size_t)(dot - filename) == prefix_len)
+	{
+		return 0;
+	}
+	if (strstr(filename, "_merged.") != NULL)
+	{
+		return 0;
+	}
+
+	strncpy(ext_out, dot, ext_sz - 1);
+	ext_out[ext_sz - 1] = '\0';
+	return 1;
+}
+
+// Loads a single file into memory buffer (caller must free)
+static unsigned char *load_file_to_buffer(const char *path, long *out_size)
+{
+	FILE *fp = NULL;
+	long sz;
+	unsigned char *buf;
+
+	if (fopen_s(&fp, path, "rb"))
+	{
+		fprintf(stderr, "Error: Cannot open file %s\n", path);
+		return NULL;
+	}
+
+	fseek(fp, 0, SEEK_END);
+	sz = ftell(fp);
+	fseek(fp, 0, SEEK_SET);
+
+	if (sz <= 0)
+	{
+		fprintf(stderr, "Error: Empty or invalid file %s\n", path);
+		fclose(fp);
+		return NULL;
+	}
+
+	buf = (unsigned char *)malloc((size_t)sz);
+	if (!buf)
+	{
+		fprintf(stderr, "Error: Memory allocation failed\n");
+		fclose(fp);
+		return NULL;
+	}
+
+	if (sz != (long)fread_s(buf, (size_t)sz, 1, (size_t)sz, fp))
+	{
+		fprintf(stderr, "Error: Failed reading file %s\n", path);
+		fclose(fp);
+		free(buf);
+		return NULL;
+	}
+
+	fclose(fp);
+	*out_size = sz;
+	return buf;
+}
+
+// Helper: Converts any input file (MIDI or XMI) into normalized 120Hz RawMidiEvent array
+static struct RawMidiEvent *load_as_xmi_events(const char *path, long *out_fsize,
+	size_t *out_ev_count, unsigned long *out_total_ticks,
+	unsigned short *timbres, size_t *timb_count,
+	unsigned int quant_hz)
+{
+	long fsize = 0;
+	unsigned char *data = load_file_to_buffer(path, &fsize);
+	struct RawMidiEvent *events = NULL;
+	size_t ev_count = 0;
+	unsigned long max_tick = 0;
+	size_t i;
+
+	if (!data)
+	{
+		return NULL;
+	}
+
+	*out_fsize = fsize;
+
+	if (fsize >= 4 && memcmp(data, "MThd", 4) == 0)
+	{
+		// Standard MIDI input: parse header, merge tracks, quantize to 120Hz, pair notes
+		unsigned char *cur = data + 4;
+		unsigned int hdr_len = _byteswap_ulong(*(unsigned int *)cur);
+		unsigned short ntrks, division;
+		int is_smpte = 0;
+		double smpte_hz = 0.0;
+
+		cur += 6;
+		ntrks = _byteswap_ushort(*(unsigned short *)cur);
+		cur += 2;
+		division = _byteswap_ushort(*(unsigned short *)cur);
+		cur += 2;
+		if (hdr_len > 6)
+		{
+			cur += (hdr_len - 6);
+		}
+
+		if (division & 0x8000)
+		{
+			unsigned char hi = (unsigned char)((division >> 8) & 0xFF);
+			int fps_val = (hi >= 0xE0) ? -(signed char)hi : (hi & 0x7F);
+			unsigned char tpf = (unsigned char)(division & 0xFF);
+			double fps = (fps_val == 29) ? 29.97 : (double)((fps_val <= 0 || fps_val > 60) ? 25 : fps_val);
+			if (tpf == 0) tpf = 40;
+			is_smpte = 1;
+			smpte_hz = fps * (double)tpf;
+		}
+
+		events = mid_parse_and_merge_tracks(cur, data + fsize, ntrks, &ev_count, timbres, timb_count);
+		mid_quantize_to_xmi_ticks(events, ev_count, is_smpte, smpte_hz, division, quant_hz);
+		mid_pair_note_durations(events, ev_count);
+	}
+	else if (fsize >= 4 && memcmp(data, "FORM", 4) == 0)
+	{
+		// XMIDI input: decode to 60PPQN MIDI in memory, wrap in MTrk header, and parse events
+		unsigned int lEVNT = 0;
+		unsigned char *evnt_start = xmi_locate_evnt_chunk(data, &lEVNT);
+		unsigned char *midi_decode = (unsigned char *)malloc((size_t)fsize * 4 + 4104);
+		unsigned int dlen;
+		unsigned int bs_dlen;
+
+		if (!midi_decode)
+		{
+			free(data);
+			return NULL;
+		}
+
+		// Decode XMI events starting at offset +8 to leave room for the 8-byte "MTrk" header
+		dlen = xmi_decode_to_60ppqn(evnt_start, lEVNT, midi_decode + 8);
+
+		memcpy(midi_decode, "MTrk", 4);
+		bs_dlen = _byteswap_ulong(dlen);
+		memcpy(midi_decode + 4, &bs_dlen, 4);
+
+		events = mid_parse_and_merge_tracks(midi_decode, midi_decode + 8 + dlen, 1, &ev_count, timbres, timb_count);
+		mid_quantize_to_xmi_ticks(events, ev_count, 0, 0.0, DEFAULT_TIMEBASE, quant_hz);
+		mid_pair_note_durations(events, ev_count);
+
+		free(midi_decode);
+	}
+	else
+	{
+		fprintf(stderr, "Error: Unsupported file format in %s\n", path);
+		free(data);
+		return NULL;
+	}
+
+	// Calculate total span of this file (including trailing note durations)
+	for (i = 0; i < ev_count; i++)
+	{
+		unsigned long end_tick = events[i].abs_tick;
+		if (!events[i].skip && (events[i].status & 0xF0) == 0x90)
+		{
+			end_tick += events[i].duration_ticks;
+		}
+		if (end_tick > max_tick)
+		{
+			max_tick = end_tick;
+		}
+	}
+
+	// Note: Keep 'data' alive if meta_data pointers point into it, or duplicate meta_data
+	for (i = 0; i < ev_count; i++)
+	{
+		if (events[i].meta_len > 0 && events[i].meta_data != NULL)
+		{
+			unsigned char *copy = (unsigned char *)malloc(events[i].meta_len);
+			if (copy)
+			{
+				memcpy(copy, events[i].meta_data, events[i].meta_len);
+				events[i].meta_data = copy;
+			}
+		}
+	}
+
+	free(data);
+	*out_ev_count = ev_count;
+	*out_total_ticks = max_tick;
+	return events;
+}
+
+// Merges an explicit ordered list of MIDI/XMI files into a single output file
+void merge_files_list(const char **file_list, int file_count, const char *out_filename,
+	int slim_mode, unsigned int quant_hz)
+{
+	struct RawMidiEvent *merged = NULL;
+	size_t merged_count = 0;
+	size_t merged_cap = INITIAL_EVENT_CAP;
+	unsigned long current_tick_offset = 0;
+	long total_fsize = 0;
+	unsigned short timbres[MAX_TIMB_CNT];
+	size_t timb_count = 0;
+	char default_out[PATH_BUF_SIZE];
+	const char *target_path = out_filename;
+	int f_idx;
+
+	if (file_count < 2)
+	{
+		fprintf(stderr, "Error: Need at least 2 files to merge\n");
+		return;
+	}
+
+	merged = (struct RawMidiEvent *)malloc(merged_cap * sizeof(struct RawMidiEvent));
+	if (!merged)
+	{
+		fprintf(stderr, "Error: Memory allocation failed\n");
+		exit(errno);
+	}
+
+	printf("Merging %d files...\n", file_count);
+
+	for (f_idx = 0; f_idx < file_count; f_idx++)
+	{
+		const char *path = *(file_list + f_idx);
+		long fsize = 0;
+		size_t ev_cnt = 0;
+		unsigned long file_ticks = 0;
+		struct RawMidiEvent *part_events;
+		size_t i;
+
+		part_events = load_as_xmi_events(path, &fsize, &ev_cnt, &file_ticks, timbres, &timb_count, quant_hz);
+		if (!part_events)
+		{
+			fprintf(stderr, "Skipping unreadable file: %s\n", path);
+			continue;
+		}
+
+		printf("  [%d/%d] %s (events: %u, length: %lu ticks)\n",
+			f_idx + 1, file_count, path, (unsigned int)ev_cnt, file_ticks);
+
+		total_fsize += fsize;
+
+		while (merged_count + ev_cnt >= merged_cap)
+		{
+			merged_cap *= 2;
+			merged = (struct RawMidiEvent *)realloc(merged, merged_cap * sizeof(struct RawMidiEvent));
+			if (!merged)
+			{
+				fprintf(stderr, "Error: Memory reallocation failed\n");
+				exit(errno);
+			}
+		}
+
+		for (i = 0; i < ev_cnt; i++)
+		{
+			merged[merged_count] = part_events[i];
+			merged[merged_count].abs_tick += current_tick_offset;
+			merged[merged_count].seq_order = (unsigned long)merged_count;
+			merged_count++;
+		}
+
+		current_tick_offset += file_ticks;
+		free(part_events);
+	}
+
+	if (merged_count == 0)
+	{
+		fprintf(stderr, "Error: No valid events collected during merge\n");
+		free(merged);
+		return;
+	}
+
+	// Determine output path and target format (.xmi or .mid)
+	if (!target_path)
+	{
+		const char *first = *file_list;
+		const char *dot = strrchr(first, '.');
+		const char *ext = (dot && _stricmp(dot, ".mid") == 0) ? ".mid" : ".xmi";
+		char root[PATH_BUF_SIZE];
+		char ext_tmp[SUFFIX_BUF_SIZE];
+
+		if (extract_slice_root(first, root, sizeof(root), ext_tmp, sizeof(ext_tmp)))
+		{
+			sprintf(default_out, "%s_merged%s", root, ext);
+		}
+		else
+		{
+			build_out_path(first, "_merged", default_out, sizeof(default_out));
+			strcat(default_out, ext);
+		}
+		target_path = default_out;
+	}
+
+	// Save merged stream as XMI first, and if target extension is .mid, convert to MIDI
+	{
+		const char *out_dot = strrchr(target_path, '.');
+		if (out_dot && _stricmp(out_dot, ".mid") == 0)
+		{
+			char tmp_xmi[PATH_BUF_SIZE];
+			long xmi_sz = 0;
+			unsigned char *xmi_buf;
+			build_out_path(target_path, ".tmp_merge.xmi", tmp_xmi, sizeof(tmp_xmi));
+			mid_build_and_save_xmi(merged, merged_count, total_fsize, tmp_xmi,
+				timbres, timb_count, slim_mode, quant_hz, 0);
+			xmi_buf = load_file_to_buffer(tmp_xmi, &xmi_sz);
+			if (xmi_buf)
+			{
+				convert_xmi_to_mid(xmi_buf, xmi_sz, tmp_xmi, target_path, 0);
+				free(xmi_buf);
+			}
+			remove(tmp_xmi);
+		}
+		else
+		{
+			mid_build_and_save_xmi(merged, merged_count, total_fsize, target_path,
+				timbres, timb_count, slim_mode, quant_hz, 0);
+		}
+	}
+
+	// Free duplicated meta_data payloads
+	{
+		size_t i;
+		for (i = 0; i < merged_count; i++)
+		{
+			if (merged[i].meta_len > 0 && merged[i].meta_data != NULL)
+			{
+				free(merged[i].meta_data);
+			}
+		}
+	}
+	free(merged);
+}
+
+// Scans current directory for "_XX." files and merges each matching group
+void merge_directory_by_root(const char *root_prefix, const char *out_filename,
+	int slim_mode, unsigned int quant_hz)
+{
+	char *all_files[MAX_MERGE_FILES];
+	int total_found = 0;
+	int used[MAX_MERGE_FILES];
+	int i, j;
+	memset(used, 0, sizeof(used));
+#ifdef _WIN32
+	{
+		struct _finddata_t fd;
+		intptr_t hFind = _findfirst("*.*", &fd);
+		if (hFind != -1)
+		{
+			do
+			{
+				if (!(fd.attrib & _A_SUBDIR) && total_found < MAX_MERGE_FILES)
+				{
+					char r_buf[PATH_BUF_SIZE];
+					char e_buf[SUFFIX_BUF_SIZE];
+					int matched = 0;
+
+					if (root_prefix)
+					{
+						matched = matches_explicit_root(fd.name, root_prefix, e_buf, sizeof(e_buf));
+					}
+					else
+					{
+						matched = extract_slice_root(fd.name, r_buf, sizeof(r_buf), e_buf, sizeof(e_buf));
+					}
+
+					if (matched)
+					{
+						all_files[total_found] = _strdup(fd.name);
+						total_found++;
+					}
+				}
+			}
+			while (_findnext(hFind, &fd) == 0);
+			_findclose(hFind);
+		}
+	}
+#else
+	{
+		DIR *dir = opendir(".");
+		struct dirent *ent;
+		if (dir)
+		{
+			while ((ent = readdir(dir)) != NULL && total_found < MAX_MERGE_FILES)
+			{
+				char r_buf[PATH_BUF_SIZE];
+				char e_buf[SUFFIX_BUF_SIZE];
+				int matched = 0;
+
+				if (root_prefix)
+				{
+					matched = matches_explicit_root(fd.name, root_prefix, e_buf, sizeof(e_buf));
+				}
+				else
+				{
+					matched = extract_slice_root(fd.name, r_buf, sizeof(r_buf), e_buf, sizeof(e_buf));
+				}
+
+				if (matched)
+				{
+					all_files[total_found] = _strdup(fd.name);
+					total_found++;
+				}
+			}
+			closedir(dir);
+		}
+	}
+#endif
+	if (total_found == 0)
+	{
+		fprintf(stderr, "No matching slice files (*_01.mid / *_01.xmi) found in current directory.\n");
+		return;
+	}
+
+	// Sort all matched filenames alphabetically/numerically
+	qsort(all_files, (size_t)total_found, sizeof(char *), comp_filenames);
+
+	// Group files by identical (root + extension) and merge each group
+	for (i = 0; i < total_found; i++)
+	{
+		char root_a[PATH_BUF_SIZE];
+		char ext_a[SUFFIX_BUF_SIZE];
+		const char *batch[MAX_MERGE_FILES];
+		int batch_cnt = 0;
+
+		if (used[i])
+		{
+			continue;
+		}
+
+		if (root_prefix)
+		{
+			strcpy(root_a, root_prefix);
+			matches_explicit_root(all_files[i], root_prefix, ext_a, sizeof(ext_a));
+		}
+		else
+		{
+			extract_slice_root(all_files[i], root_a, sizeof(root_a), ext_a, sizeof(ext_a));
+		}
+
+		batch[batch_cnt++] = all_files[i];
+		used[i] = 1;
+
+		for (j = i + 1; j < total_found; j++)
+		{
+			char root_b[PATH_BUF_SIZE];
+			char ext_b[SUFFIX_BUF_SIZE];
+			if (!used[j])
+			{
+				if (root_prefix)
+				{
+					strcpy(root_b, root_prefix);
+					matches_explicit_root(all_files[j], root_prefix, ext_b, sizeof(ext_b));
+				}
+				else
+				{
+					extract_slice_root(all_files[j], root_b, sizeof(root_b), ext_b, sizeof(ext_b));
+				}
+
+				if (_stricmp(root_a, root_b) == 0 && _stricmp(ext_a, ext_b) == 0)
+				{
+					batch[batch_cnt++] = all_files[j];
+					used[j] = 1;
+				}
+			}
+		}
+
+		if (batch_cnt >= 2)
+		{
+			char auto_out[PATH_BUF_SIZE];
+			const char *group_out = out_filename;
+			if (!group_out)
+			{
+				sprintf(auto_out, "%s_merged%s", root_a, ext_a);
+				group_out = auto_out;
+			}
+			printf("\nFound group '%s*%s' (%d files):\n", root_a, ext_a, batch_cnt);
+			merge_files_list(batch, batch_cnt, group_out, slim_mode, quant_hz);
+		}
+		else
+		{
+			printf("Skipping single file '%s' (need at least 2 files to merge)\n", all_files[i]);
+		}
+	}
+
+	for (i = 0; i < total_found; i++)
+	{
+		free(all_files[i]);
+	}
+
+}
+
+//==============================================================================
+// 8. CLI Argument Parser & Main Entry Point
 //==============================================================================
 int main(int argc, char **argv)
 {
@@ -1641,6 +2226,12 @@ int main(int argc, char **argv)
 	unsigned int slice_max_bytes = 0;
 	long fsize;
 	unsigned char *midi_data = NULL;
+
+	int merge_mode = 0;
+	int mergename_mode = 0;
+	const char *merge_root = NULL;
+	const char *merge_list[MAX_MERGE_FILES];
+	int merge_list_cnt = 0;
 
 	// Parse positional filenames and optional flags in any order
 	for (i = 1; i < argc; i++)
@@ -1675,6 +2266,30 @@ int main(int argc, char **argv)
 				return -1;
 			}
 		}
+		else if (_stricmp(argv[i], "-merge") == 0 || _stricmp(argv[i], "/merge") == 0)
+		{
+			merge_mode = 1;
+			// Optional root prefix argument (if next arg does not start with '-' or '/')
+			if (i + 1 < argc && *argv[i + 1] != '-' && *argv[i + 1] != '/')
+			{
+				merge_root = argv[++i];
+			}
+		}
+		else if (_stricmp(argv[i], "-mergename") == 0 || _stricmp(argv[i], "/mergename") == 0)
+		{
+			mergename_mode = 1;
+			while (i + 1 < argc && *argv[i + 1] != '-' && *argv[i + 1] != '/')
+			{
+				if (merge_list_cnt < MAX_MERGE_FILES)
+				{
+					merge_list[merge_list_cnt++] = argv[++i];
+				}
+				else
+				{
+					i++;
+				}
+			}
+		}
 		else if (!in_file)
 		{
 			in_file = argv[i];
@@ -1690,19 +2305,52 @@ int main(int argc, char **argv)
 		}
 	}
 
+    if (mergename_mode)
+    {
+		// If user passed output file as last item in list (e.g. "a.xmi b.xmi out.xmi"),
+		// or via separate out_file, detect if last file doesn't exist yet on disk
+        const char *explicit_out = out_file;
+        if (!explicit_out && merge_list_cnt >= 3)
+        {
+            FILE *test_f = NULL;
+            if (fopen_s(&test_f, merge_list[merge_list_cnt - 1], "rb") != 0)
+            {
+                explicit_out = merge_list[--merge_list_cnt];
+            }
+            else
+            {
+                fclose(test_f);
+            }
+        }
+        merge_files_list(merge_list, merge_list_cnt, explicit_out, slim_mode, quant_hz);
+        return 0;
+    }
+
+	if (merge_mode)
+	{
+		merge_directory_by_root(merge_root, out_file, slim_mode, quant_hz);
+		return 0;
+	}
+
 	if (!in_file)
 	{
-		printf("XMI2MID07 - Bidirectional MIDI <-> XMIDI Converter & Slicer\n\n");
-		printf("Usage: %s [outfile] [-slim] [-q:Hz] [-slice ]\n\n", *argv);
+		printf("XMI2MID07 - Bidirectional MIDI <-> XMIDI Converter, Slicer & Merger\n\n");
+		printf("Usage:\n");
+		printf("  %s <infile> [outfile] [-slim] [-q:Hz] [-slice <bytes>]\n", *argv);
+		printf("  %s -merge [root] [outfile] [-slim] [-q:Hz]\n", *argv);
+		printf("  %s -mergename <file1> <file2> ... [outfile] [-slim] [-q:Hz]\n\n", *argv);
 		printf("Options:\n");
-		printf(" -slim : Strip Aftertouch & duplicate CCs (keeps Pitch Bend)\n");
-		printf(" -q:Hz : Set XMIDI quantization rate in Hz (default: 120)\n");
-		printf(" -slice : Slice output into multiple valid files <= \n");
-		printf(" (also accepts -slice:)\n\n");
+		printf("  -slim          : Strip Aftertouch & duplicate CCs (keeps Pitch Bend)\n");
+		printf("  -q:Hz          : Set XMIDI quantization rate in Hz (default: 120)\n");
+		printf("  -slice <bytes> : Slice output into multiple valid files <= <bytes>\n");
+		printf("  -merge [root]  : Auto-merge sliced *_01.* files in current folder\n");
+		printf("  -mergename ... : Merge explicitly listed files in order\n\n");
 		printf("Examples:\n");
-		printf(" %s e1l4.mid e1l4.xmi -slim\n", *argv);
-		printf(" %s e1l4.mid e1l4.xmi -slim -slice 65536\n", *argv);
-		printf(" %s e1l4.xmi e1l4.mid -slice 32768\n", *argv);
+		printf("  %s e1l4.mid e1l4.xmi -slim\n", *argv);
+		printf("  %s e1l4.mid e1l4.xmi -slim -slice 65536\n", *argv);
+		printf("  %s -merge\n", *argv);
+		printf("  %s -merge e1l4\n", *argv);
+		printf("  %s -mergename part1.xmi part2.xmi full.xmi\n", *argv);
 		return -1;
 	}
 
