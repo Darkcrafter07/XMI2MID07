@@ -11,7 +11,7 @@ Built with zero external dependencies and compatible with **Windows XP (32-bit)*
 * **Accurate Timing:** Uses John Miles' `MIDIFORM` DDA accumulator algorithm for 120 Hz quantization, with full support for Tempo meta-events and legacy SMPTE time divisions.
 * **Custom Quantization (`-q:Hz`):** Overrides the default 120 Hz quantization rate for files with non-standard timing.
 * **Slim Mode (`-slim`):** Reduces output `.xmi` size by stripping Aftertouch (`0xA0`/`0xD0`), redundant text meta-events, and duplicate Control Changes while preserving **Pitch Bend**.
-* **Exact Byte-Size Slicing (`-slice <bytes>`):** Splits `.mid` or `.xmi` files into valid, self-contained chunks (`_01`, `_02`, ...) strictly under the specified byte limit, cleanly closing active notes and restoring instruments, volume, pan, tempo, Pitch Bend, and Pitch Bend Sensitivity (`RPN 0,0`) across boundaries.
+* **Exact Byte-Size Slicing (`-slice <bytes>`):** Splits `.mid` or `.xmi` files into valid, self-contained chunks (`_01`, `_02`, ...) strictly under the specified byte limit, cleanly closing active notes and restoring instruments, volume, pan, tempo, Pitch Bend, and Pitch Bend Sensitivity (`RPN 0,0`) across boundaries. Chops notes so that a note that continued to play from a previous slice starts playing again (crucial for stuff like pads).
 * **Seamless File Merging (`-merge` & `-mergename`):** Concatenates multiple `.mid` or `.xmi` files back into a single continuous track with accurate timeline offsets.
 * **Clean XMI-to-MIDI Decoding:** Handles variable-length note durations and prevents hanging/overlapping notes on rapid re-triggers.
 
