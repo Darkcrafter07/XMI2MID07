@@ -105,6 +105,8 @@ struct ChannelState
     unsigned char rpn_lsb[MAX_CHANNELS];    // Last RPN LSB (CC 100)
     unsigned char rpn_range[MAX_CHANNELS];  // Pitch Bend sensitivity in semitones (RPN 0,0 -> CC 6)
     unsigned char has_rpn[MAX_CHANNELS];    // Flag: 1 if custom Pitch Bend range was set
+	unsigned char active_vel[MAX_CHANNELS][MAX_NOTES];    // To chop played notes
+	unsigned long note_end_tick[MAX_CHANNELS][MAX_NOTES]; // To chop played notes
 };
 
 //------------------------------------------------------------------------------

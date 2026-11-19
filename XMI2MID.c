@@ -254,6 +254,8 @@ static void ch_state_init(struct ChannelState *st)
 	memset(st->rpn_lsb, 0x7F, sizeof(st->rpn_lsb));
 	memset(st->rpn_range, 2, sizeof(st->rpn_range));
 	memset(st->has_rpn, 0, sizeof(st->has_rpn));
+	memset(st->active_vel, 0, sizeof(st->active_vel));
+	memset(st->note_end_tick, 0, sizeof(st->note_end_tick));
 }
 
 // Updates channel state when a Control Change (0xB0) message is encountered
@@ -310,9 +312,9 @@ static void emit_state_msg(unsigned char **cur, int is_midi, unsigned char b0, u
 	}
 }
 
-// Restores active instruments, volume, pan, RPN range, and pitch bend at the start of a new slice
+// Restores active instruments, volume, pan, RPN range, pitch bend, and split notes at slice start
 static void ch_state_emit_restore(const struct ChannelState *st, unsigned char **cur, int is_midi,
-	unsigned short *timbres, size_t *timb_cnt)
+	unsigned short *timbres, size_t *timb_cnt, unsigned long slice_start_tick)
 {
 	int c;
 
@@ -362,6 +364,7 @@ static void ch_state_emit_restore(const struct ChannelState *st, unsigned char *
 		{
 			emit_state_msg(cur, is_midi, (unsigned char)(0xB0 | c), 0x0A, 1, st->pan[c]);
 		}
+
 		// 3. Restore Pitch Bend Sensitivity (RPN 0,0) BEFORE Pitch Bend wheel value
 		if (st->has_rpn[c])
 		{
@@ -369,10 +372,28 @@ static void ch_state_emit_restore(const struct ChannelState *st, unsigned char *
 			emit_state_msg(cur, is_midi, (unsigned char)(0xB0 | c), 100, 1, 0);
 			emit_state_msg(cur, is_midi, (unsigned char)(0xB0 | c), 6, 1, st->rpn_range[c]);
 		}
+
 		// 4. Restore Pitch Bend wheel position (only if used on this channel)
 		if (st->has_pitch[c])
 		{
 			emit_state_msg(cur, is_midi, (unsigned char)(0xE0 | c), st->pitch_lsb[c], 1, st->pitch_msb[c]);
+		}
+
+		// 5. Re-trigger sustained notes (pads/bass) split across the XMI slice boundary
+		if (!is_midi)
+		{
+			int n;
+			for (n = 0; n < MAX_NOTES; n++)
+			{
+				if (st->active_vel[c][n] > 0 && st->note_end_tick[c][n] > slice_start_tick)
+				{
+					unsigned long rem_dur = st->note_end_tick[c][n] - slice_start_tick;
+					*(*cur)++ = (unsigned char)(0x90 | c);
+					*(*cur)++ = (unsigned char)n;
+					*(*cur)++ = st->active_vel[c][n];
+					write_vlq(cur, rem_dur);
+				}
+			}
 		}
 	}
 }
@@ -759,18 +780,18 @@ static void mid_rescale_and_write(unsigned char *midi_decode, unsigned int dlen,
 	unsigned char *midi_write = (unsigned char *)malloc((size_t)dlen * 2 + 65536);
 	unsigned char *tcur = midi_write;
 	unsigned char *pos = midi_decode;
+	struct ChannelState ch_state;
 	unsigned char active_notes[MAX_CHANNELS][MAX_NOTES];
 	unsigned char tempo_b0 = 0x07, tempo_b1 = 0xA1, tempo_b2 = 0x20;
 	unsigned int slice_idx = 1;
 	int has_tempo = 0;
-
-	struct ChannelState ch_state;
 
 	if (!midi_write)
 	{
 		fprintf(stderr, "Error: Memory allocation failed\n");
 		exit(errno);
 	}
+
 	if (slice_max_bytes > 0 && slice_max_bytes < MIN_SLICE_BYTES)
 	{
 		fprintf(stderr, "Error: -slice size too small (minimum %d bytes)\n", MIN_SLICE_BYTES);
@@ -783,19 +804,23 @@ static void mid_rescale_and_write(unsigned char *midi_decode, unsigned int dlen,
 
 	while (pos < dcur)
 	{
+		unsigned char *delta_start_pos = pos;
 		unsigned int delta = (unsigned int)read_vlq(&pos, dcur);
 		double factor = (double)timebase * (double)DEFAULT_QN / ((double)qnlen * (double)DEFAULT_TIMEBASE);
-		unsigned char *event_start_pos = pos;
 		unsigned char *tcur_checkpoint = tcur;
 		unsigned int saved_qnlen = qnlen;
+		struct ChannelState saved_ch_state = ch_state;
+		unsigned char saved_note_ch = 0xFF;
+		unsigned char saved_note_num = 0;
+		unsigned char saved_note_prev_vel = 0;
 		int is_eot = 0;
 
-		// Rewind checkpoint must include the delta bytes before the event
-		// Note: event_start_pos is saved BEFORE reading delta in sliced mode below
 		delta = (unsigned int)((double)delta * factor + 0.5);
-		// If starting slice > 1, restore Tempo and active ChannelState at tick 0
+
+		// If starting slice > 1, restore Tempo, ChannelState, and re-trigger split notes at tick 0
 		if (slice_max_bytes > 0 && slice_idx > 1 && tcur == midi_write)
 		{
+			int c, n;
 			if (has_tempo)
 			{
 				*tcur++ = 0x00;
@@ -806,22 +831,49 @@ static void mid_rescale_and_write(unsigned char *midi_decode, unsigned int dlen,
 				*tcur++ = tempo_b1;
 				*tcur++ = tempo_b2;
 			}
-			ch_state_emit_restore(&ch_state, &tcur, 1, NULL, NULL);
+			ch_state_emit_restore(&ch_state, &tcur, 1, NULL, NULL, 0);
+
+			// Re-trigger sustained notes (pads/bass) split across the MIDI slice boundary
+			for (c = 0; c < MAX_CHANNELS; c++)
+			{
+				for (n = 0; n < MAX_NOTES; n++)
+				{
+					if (active_notes[c][n] > 0)
+					{
+						*tcur++ = 0x00;
+						*tcur++ = (unsigned char)(0x90 | c);
+						*tcur++ = (unsigned char)n;
+						*tcur++ = active_notes[c][n];
+					}
+				}
+			}
 			tcur_checkpoint = tcur;
 		}
+
 		write_vlq(&tcur, delta);
 
-		// Copy event and update channel state trackers
+		// Copy event and update channel state trackers (saving previous note state for rollback)
 		if (0x80 == (*pos & 0xF0))
 		{
-			active_notes[*pos & 0x0F][(*pos + 1)] = 0;
+			unsigned char ch = *pos & 0x0F;
+			unsigned char note = *(pos + 1);
+			saved_note_ch = ch;
+			saved_note_num = note;
+			saved_note_prev_vel = active_notes[ch][note];
+			active_notes[ch][note] = 0;
 			*tcur++ = *pos++;
 			*tcur++ = *pos++;
 			*tcur++ = *pos++;
 		}
 		else if (0x90 == (*pos & 0xF0))
 		{
-			active_notes[*pos & 0x0F][(*pos + 1)] = ((pos + 2) > 0) ? 1 : 0;
+			unsigned char ch = *pos & 0x0F;
+			unsigned char note = *(pos + 1);
+			unsigned char vel = *(pos + 2);
+			saved_note_ch = ch;
+			saved_note_num = note;
+			saved_note_prev_vel = active_notes[ch][note];
+			active_notes[ch][note] = (vel > 0) ? vel : 0;
 			*tcur++ = *pos++;
 			*tcur++ = *pos++;
 			*tcur++ = *pos++;
@@ -915,11 +967,12 @@ static void mid_rescale_and_write(unsigned char *midi_decode, unsigned int dlen,
 			unsigned int active_cnt = 0;
 			int c, n;
 			unsigned int projected_size;
+
 			for (c = 0; c < MAX_CHANNELS; c++)
 			{
 				for (n = 0; n < MAX_NOTES; n++)
 				{
-					if (active_notes[c][n])
+					if (active_notes[c][n] > 0)
 					{
 						active_cnt++;
 					}
@@ -928,45 +981,46 @@ static void mid_rescale_and_write(unsigned char *midi_decode, unsigned int dlen,
 
 			// Projected size = 22-byte header + track bytes + pending Note-Offs + 4-byte EOT
 			projected_size = 22 + (unsigned int)(tcur - midi_write) + (active_cnt * 4) + 4;
+
 			if (projected_size > slice_max_bytes && tcur_checkpoint > midi_write)
 			{
 				char slice_path[PATH_BUF_SIZE];
 				unsigned int tlen;
-				// Roll back to before the overflowing event (including its delta)
+
+				// Roll back pointers AND synthesizer/note states to before the overflowing event
 				tcur = tcur_checkpoint;
-				pos = event_start_pos;
-				// Rewind pos back to the start of its VLQ delta
-				while (pos > midi_decode && (*(pos - 1) & 0x80))
-				{
-					pos--;
-				}
-				if (pos > midi_decode)
-				{
-					pos--;
-				}
+				pos = delta_start_pos;
 				qnlen = saved_qnlen;
-				// Close all hanging notes cleanly before ending this slice
+				ch_state = saved_ch_state;
+				if (saved_note_ch < MAX_CHANNELS)
+				{
+					active_notes[saved_note_ch][saved_note_num] = saved_note_prev_vel;
+				}
+
+				// Close all hanging notes at the end of this slice (keep velocity in active_notes for next slice)
 				for (c = 0; c < MAX_CHANNELS; c++)
 				{
 					for (n = 0; n < MAX_NOTES; n++)
 					{
-						if (active_notes[c][n])
+						if (active_notes[c][n] > 0)
 						{
 							*tcur++ = 0x00;
 							*tcur++ = (unsigned char)(0x80 | c);
 							*tcur++ = (unsigned char)n;
 							*tcur++ = 0x00;
-							active_notes[c][n] = 0;
 						}
 					}
 				}
+
 				*tcur++ = 0x00;
 				*tcur++ = 0xFF;
 				*tcur++ = 0x2F;
 				*tcur++ = 0x00;
+
 				tlen = (unsigned int)(tcur - midi_write);
 				build_slice_path(target_path, slice_idx++, slice_path, sizeof(slice_path));
 				write_mid_file(slice_path, midi_write, tlen);
+
 				tcur = midi_write;
 			}
 		}
@@ -989,6 +1043,7 @@ static void mid_rescale_and_write(unsigned char *midi_decode, unsigned int dlen,
 			}
 		}
 	}
+
 	free(midi_write);
 }
 
@@ -1357,7 +1412,8 @@ static void mid_build_and_save_xmi(struct RawMidiEvent *events, size_t ev_count,
 		// Restore active channel state at the start of slice > 1
 		if (slice_max_bytes > 0 && slice_idx > 1 && ecur == evnt_buf)
 		{
-			ch_state_emit_restore(&ch_state, &ecur, 0, slice_timbres, &slice_timb_cnt);
+			// Pass current even tick for XMI
+			ch_state_emit_restore(&ch_state, &ecur, 0, slice_timbres, &slice_timb_cnt, events[i].abs_tick);
 			prev_xmi_tick = events[i].abs_tick;
 		}
 
@@ -1443,7 +1499,13 @@ static void mid_build_and_save_xmi(struct RawMidiEvent *events, size_t ev_count,
 		}
 
 		// Update shared ChannelState tracker
-		if (cmd == 0xB0)
+		if (cmd == 0x90)
+		{
+			// Write note end time
+			ch_state.active_vel[ch][events[i].d1] = events[i].d2;
+			ch_state.note_end_tick[ch][events[i].d1] = events[i].abs_tick + events[i].duration_ticks;
+		}
+		else if (cmd == 0xB0)
 		{
 			ch_state_track_cc(&ch_state, ch, events[i].d1, events[i].d2);
 		}
@@ -2409,5 +2471,6 @@ int main(int argc, char **argv)
 
 	return 0;
 }
+
 
 
