@@ -1,8 +1,30 @@
 # XMI2MID07
+by Darkcrafter07, darkcrafter774@gmail.com
+https://github.com/Darkcrafter07/XMI2MID07
 
 A cross-platform, modular ANSI C command-line utility (`XMI2MID.h` / `XMI2MID.c`) for bidirectional conversion, exact byte-size slicing, and seamless merging between Standard MIDI (`.mid`) and Miles Sound System Extended MIDI (`.xmi`).
 
-Built with zero external dependencies and compatible with **Windows XP (32-bit)** up to modern Windows, Linux, and macOS.
+Built with zero external dependencies and compatible with **MS-DOS 7.10, Windows XP (32-bit)** up to modern Windows, Linux, and macOS.
+
+1) For DOS:
+a. Run Windows 95;
+b. Install Watcom 11.0;
+c. Run Windows/Norton/Volkov Commander;
+d. Navigate to src folder;
+e. Run make.bat or execute "wmake" command;
+f. The exe will appear in "src" folder.
+
+2) For modern OS like Windows XP+, Mac OS, Linux etc...
+a) Get CMake v3.10+ if you don't want DOS, pick the folder you put the files in "where is the source code" field; 
+b) Copy paste that folder path in "Where to build the binaries", add /Build after;
+c) Press "Confgiure". Build directory does not exist, create? - YES;
+d) Select MSVC 2015 or 2017 as a generator, optional platform -> Win32, optional toolset v140_xp ;
+e) Press "Generate"
+f) Navigate to "/Build/"
+h) Find xmi2mid.sln, open it with your MSVC2015/2017/2022/2026 etc...
+i) You may build a "debug" version but I'd go with "release" to make it run fast;
+j) In Solution Explorer tab (right or left to the screen) find "XMI2MID" project, click right mouse button, press "Compile"
+k) The exe will appaer in "/Build/Debug/" or in "/Build/Release"/.
 
 ## Features
 
