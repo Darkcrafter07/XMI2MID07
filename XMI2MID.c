@@ -776,15 +776,17 @@ static unsigned int xmi_decode_to_60ppqn(unsigned char *evnt_start, unsigned int
 static void mid_rescale_and_write(unsigned char *midi_decode, unsigned int dlen,
 	const char *target_path, unsigned int slice_max_bytes)
 {
+	int c, n, has_tempo = 0, is_eot = 0;
+	unsigned int delta, saved_qnlen, active_cnt, projected_size, tlen, slice_idx = 1;
+	unsigned long scale_num, scale_den, rem_d, scaled_delta, rem_acc, step, prod, exlen, mlen;
 	unsigned char *dcur = midi_decode + dlen;
 	unsigned char *midi_write = (unsigned char *)malloc((size_t)dlen * 2 + 65536);
-	unsigned char *tcur = midi_write;
-	unsigned char *pos = midi_decode;
-	struct ChannelState ch_state;
+	unsigned char *tcur = midi_write, *pos = midi_decode, *delta_start_pos, *tcur_checkpoint;
 	unsigned char active_notes[MAX_CHANNELS][MAX_NOTES];
 	unsigned char tempo_b0 = 0x07, tempo_b1 = 0xA1, tempo_b2 = 0x20;
-	unsigned int slice_idx = 1;
-	int has_tempo = 0;
+	unsigned char saved_note_ch, saved_note_num, saved_note_prev_vel, ch, note, vel;
+	char slice_path[PATH_BUF_SIZE];
+	struct ChannelState ch_state, saved_ch_state;
 
 	if (!midi_write)
 	{
@@ -804,23 +806,34 @@ static void mid_rescale_and_write(unsigned char *midi_decode, unsigned int dlen,
 
 	while (pos < dcur)
 	{
-		unsigned char *delta_start_pos = pos;
-		unsigned int delta = (unsigned int)read_vlq(&pos, dcur);
-		double factor = (double)timebase * (double)DEFAULT_QN / ((double)qnlen * (double)DEFAULT_TIMEBASE);
-		unsigned char *tcur_checkpoint = tcur;
-		unsigned int saved_qnlen = qnlen;
-		struct ChannelState saved_ch_state = ch_state;
-		unsigned char saved_note_ch = 0xFF;
-		unsigned char saved_note_num = 0;
-		unsigned char saved_note_prev_vel = 0;
-		int is_eot = 0;
+		delta_start_pos = pos;
+		delta = (unsigned int)read_vlq(&pos, dcur);
+		scale_num = ((unsigned long)timebase * (unsigned long)DEFAULT_QN) / (unsigned long)DEFAULT_TIMEBASE;
+		scale_den = (qnlen > 0) ? (unsigned long)qnlen : (unsigned long)DEFAULT_QN;
+		rem_d = (unsigned long)delta;
+		scaled_delta = 0;
+		rem_acc = scale_den >> 1; // +0.5 rounding
+		tcur_checkpoint = tcur;
+		saved_qnlen = qnlen;
+		saved_ch_state = ch_state;
+		saved_note_ch = 0xFF;
+		saved_note_num = 0;
+		saved_note_prev_vel = 0;
+		is_eot = 0;
 
-		delta = (unsigned int)((double)delta * factor + 0.5);
+		while (rem_d > 0)
+		{
+			step = (rem_d > 256UL) ? 256UL : rem_d;
+			prod = step * scale_num + rem_acc;
+			scaled_delta += prod / scale_den;
+			rem_acc = prod % scale_den;
+			rem_d -= step;
+		}
+		delta = (unsigned int)scaled_delta;
 
 		// If starting slice > 1, restore Tempo, ChannelState, and re-trigger split notes at tick 0
 		if (slice_max_bytes > 0 && slice_idx > 1 && tcur == midi_write)
 		{
-			int c, n;
 			if (has_tempo)
 			{
 				*tcur++ = 0x00;
@@ -855,8 +868,8 @@ static void mid_rescale_and_write(unsigned char *midi_decode, unsigned int dlen,
 		// Copy event and update channel state trackers (saving previous note state for rollback)
 		if (0x80 == (*pos & 0xF0))
 		{
-			unsigned char ch = *pos & 0x0F;
-			unsigned char note = *(pos + 1);
+			ch = *pos & 0x0F;
+			note = *(pos + 1);
 			saved_note_ch = ch;
 			saved_note_num = note;
 			saved_note_prev_vel = active_notes[ch][note];
@@ -867,9 +880,9 @@ static void mid_rescale_and_write(unsigned char *midi_decode, unsigned int dlen,
 		}
 		else if (0x90 == (*pos & 0xF0))
 		{
-			unsigned char ch = *pos & 0x0F;
-			unsigned char note = *(pos + 1);
-			unsigned char vel = *(pos + 2);
+			ch = *pos & 0x0F;
+			note = *(pos + 1);
+			vel = *(pos + 2);
 			saved_note_ch = ch;
 			saved_note_num = note;
 			saved_note_prev_vel = active_notes[ch][note];
@@ -911,7 +924,6 @@ static void mid_rescale_and_write(unsigned char *midi_decode, unsigned int dlen,
 		}
 		else if (0xF0 == *pos || 0xF7 == *pos)
 		{
-			unsigned long exlen;
 			*tcur++ = *pos++;
 			exlen = read_vlq(&pos, dcur);
 			write_vlq(&tcur, exlen);
@@ -946,7 +958,6 @@ static void mid_rescale_and_write(unsigned char *midi_decode, unsigned int dlen,
 			}
 			else
 			{
-				unsigned long mlen;
 				*tcur++ = *pos++;
 				mlen = read_vlq(&pos, dcur);
 				write_vlq(&tcur, mlen);
@@ -964,9 +975,7 @@ static void mid_rescale_and_write(unsigned char *midi_decode, unsigned int dlen,
 		// Check if current MIDI slice reached the byte ceiling
 		if (slice_max_bytes > 0 && !is_eot)
 		{
-			unsigned int active_cnt = 0;
-			int c, n;
-			unsigned int projected_size;
+			active_cnt = 0;
 
 			for (c = 0; c < MAX_CHANNELS; c++)
 			{
@@ -984,9 +993,6 @@ static void mid_rescale_and_write(unsigned char *midi_decode, unsigned int dlen,
 
 			if (projected_size > slice_max_bytes && tcur_checkpoint > midi_write)
 			{
-				char slice_path[PATH_BUF_SIZE];
-				unsigned int tlen;
-
 				// Roll back pointers AND synthesizer/note states to before the overflowing event
 				tcur = tcur_checkpoint;
 				pos = delta_start_pos;
@@ -1027,20 +1033,17 @@ static void mid_rescale_and_write(unsigned char *midi_decode, unsigned int dlen,
 	}
 
 	// Write the final (or single) MIDI file exact to its byte length
+	tlen = (unsigned int)(tcur - midi_write);
+	if (tlen > 0)
 	{
-		unsigned int tlen = (unsigned int)(tcur - midi_write);
-		if (tlen > 0)
+		if (slice_max_bytes > 0)
 		{
-			if (slice_max_bytes > 0)
-			{
-				char slice_path[PATH_BUF_SIZE];
-				build_slice_path(target_path, slice_idx, slice_path, sizeof(slice_path));
-				write_mid_file(slice_path, midi_write, tlen);
-			}
-			else
-			{
-				write_mid_file(target_path, midi_write, tlen);
-			}
+			build_slice_path(target_path, slice_idx, slice_path, sizeof(slice_path));
+			write_mid_file(slice_path, midi_write, tlen);
+		}
+		else
+		{
+			write_mid_file(target_path, midi_write, tlen);
 		}
 	}
 
@@ -1234,53 +1237,70 @@ static struct RawMidiEvent *mid_parse_and_merge_tracks(unsigned char *cur, unsig
 
 // Quantizes event timestamps to 120 Hz using John Miles' MIDIFORM DDA accumulator
 static void mid_quantize_to_xmi_ticks(struct RawMidiEvent *events, size_t ev_count,
-	int is_smpte, double smpte_ticks_per_sec,
-	unsigned short division, unsigned int quant_hz)
+                                      int is_smpte, unsigned long smpte_num, unsigned long smpte_den,
+                                      unsigned short division, unsigned int quant_hz)
 {
-	const long double q_int = 100000000.0L / (long double)quant_hz;
-	long double tick_time = is_smpte
-		? (100000000.0L / (long double)smpte_ticks_per_sec)
-		: (50000000.0L / (long double)division);
-	long double dda_sum = 0.0L;
-	unsigned long xmi_interval = 0;
-	unsigned long last_midi_tick = 0;
-	size_t i;
+    unsigned long q_hz = (quant_hz > 0) ? (unsigned long)quant_hz : XMI_FREQ;
+    unsigned long tick_num;
+    unsigned long tick_den;
+    unsigned long dda_sum = 0;
+    unsigned long xmi_interval = 0;
+    unsigned long last_midi_tick = 0;
+    size_t i;
 
-	for (i = 0; i < ev_count; i++)
-	{
-		unsigned long event_delta = events[i].abs_tick - last_midi_tick;
-		last_midi_tick = events[i].abs_tick;
-		if (event_delta > 0)
-		{
-			dda_sum += (long double)event_delta * tick_time;
-			while (dda_sum >= q_int)
-			{
-				dda_sum -= q_int;
-				xmi_interval++;
-			}
-		}
-		events[i].abs_tick = xmi_interval;
+    if (division == 0)
+    {
+        division = DEFAULT_TIMEBASE;
+    }
+
+    if (is_smpte)
+    {
+        tick_num = q_hz * smpte_den;
+        tick_den = (smpte_num > 0) ? smpte_num : 1UL;
+    }
+    else
+    {
+        // Default 120 BPM = 500,000 us per quarter note
+        tick_num = (q_hz * 500000UL) / 400UL;
+        tick_den = 2500UL * (unsigned long)division;
+    }
+
+    for (i = 0; i < ev_count; i++)
+    {
+        unsigned long event_delta = events[i].abs_tick - last_midi_tick;
+        last_midi_tick = events[i].abs_tick;
+
+        if (event_delta > 0 && tick_den > 0)
+        {
+            while (event_delta > 0)
+            {
+                unsigned long chunk = (event_delta > 4096UL) ? 4096UL : event_delta;
+                dda_sum += chunk * tick_num;
+                if (dda_sum >= tick_den)
+                {
+                    unsigned long steps = dda_sum / tick_den;
+                    xmi_interval += steps;
+                    dda_sum -= steps * tick_den;
+                }
+                event_delta -= chunk;
+            }
+        }
+        events[i].abs_tick = xmi_interval;
 
         // Update tick duration on Tempo Meta-Events (0xFF 0x51) in PPQN mode
         if (!is_smpte && events[i].status == 0xFF && events[i].d1 == 0x51 && events[i].meta_len == 3)
         {
             unsigned char *md = events[i].meta_data;
             unsigned long tempo_us = ((unsigned long)(*(md + 0)) << 16) |
-                                     ((unsigned long)(*(md + 1)) << 8) |
+                                     ((unsigned long)(*(md + 1)) << 8)  |
                                      (unsigned long)(*(md + 2));
-            tick_time = (100.0L * (long double)tempo_us) / (long double)division;
+            if (tempo_us > 0)
+            {
+                tick_num = (q_hz * tempo_us) / 400UL;
+                tick_den = 2500UL * (unsigned long)division;
+            }
         }
-		// Must be like this otherwise gets ULTRA SLOW:
-		//if (!is_smpte && events[i].status == 0xFF && events[i].d1 == 0x51 && events[i].meta_len == 3)
-		//{
-		//	unsigned char *md = events[i].meta_data;
-		//	unsigned long tempo_us = ((unsigned long)(*(md + 0)) << 16) |
-		//		((unsigned long)(*(md + 1)) << 8) |
-		//		(unsigned long)(*(md + 2));
-		//	tick_time = (100.0L * (long double)tempo_us) / (long double)division;
-		//}
-
-	}
+    }
 }
 
 // Pairs every Note-On (0x90) with its corresponding Note-Off (0x80) to compute duration
@@ -1602,18 +1622,16 @@ void convert_mid_to_xmi(unsigned char *midi_data, long fsize, const char *in_fil
 	const char *out_filename, int slim_mode, unsigned int quant_hz,
 	unsigned int slice_max_bytes)
 {
-	unsigned char *cur = midi_data;
-	unsigned char *end = midi_data + fsize;
+	int is_smpte = 0, fps_val;
 	unsigned int hdr_len;
-	unsigned short format, ntrks, division;
-	int is_smpte = 0;
-	double smpte_ticks_per_sec = 0.0;
-	size_t ev_count = 0;
-	size_t timb_count = 0;
-	unsigned short timbres[MAX_TIMB_CNT];
-	struct RawMidiEvent *events = NULL;
-	char pt[PATH_BUF_SIZE];
+	unsigned short format, ntrks, division, timbres[MAX_TIMB_CNT];
+	unsigned long smpte_num = 0, smpte_den = 1, fps_u;
+	unsigned char *cur = midi_data, *end = midi_data + fsize, hi, tpf;
 	const char *target_path = out_filename;
+	char pt[PATH_BUF_SIZE];
+	size_t ev_count = 0, timb_count = 0;
+	struct RawMidiEvent *events = NULL;
+
 	if (fsize < 14 || memcmp(cur, "MThd", 4))
 	{
 		fprintf(stderr, "Error: Invalid MIDI header (MThd missing)\n");
@@ -1647,31 +1665,39 @@ void convert_mid_to_xmi(unsigned char *midi_data, long fsize, const char *in_fil
 		cur += (hdr_len - 6);
 	}
 
-	// Parse TPQN or SMPTE time division
+	// Parse TPQN or SMPTE time division (100% integer rational, no FPU)
 	if (division & 0x8000)
 	{
-		unsigned char hi = (unsigned char)((division >> 8) & 0xFF);
-		int fps_val = (hi >= 0xE0) ? -(signed char)hi : (hi & 0x7F);
-		unsigned char tpf = (unsigned char)(division & 0xFF);
-		double fps;
+		hi = (unsigned char)((division >> 8) & 0xFF);
+		fps_val = (hi >= 0xE0) ? -(signed char)hi : (hi & 0x7F);
+		tpf = (unsigned char)(division & 0xFF);
 		is_smpte = 1;
-		if (fps_val <= 0 || fps_val > 60)
-		{
-			fps_val = 25;
-		}
-		fps = (fps_val == 29) ? 29.97 : (double)fps_val;
 		if (tpf == 0)
 		{
 			tpf = 40;
 		}
-		smpte_ticks_per_sec = fps * (double)tpf;
-		printf("MIDI Format: %d, Tracks: %d, SMPTE: %.2f FPS, %d ticks/frame (%.1f Hz)\n",
-			format, ntrks, fps, tpf, smpte_ticks_per_sec);
+		if (fps_val == 29)
+		{
+			// 29.97 fps = 30000 / 1001
+			smpte_num = 30000UL * (unsigned long)tpf;
+			smpte_den = 1001UL;
+			printf("MIDI Format: %d, Tracks: %d, SMPTE: 29.97 FPS, %d ticks/frame (%lu/%lu Hz)\n",
+				format, ntrks, tpf, smpte_num, smpte_den);
+		}
+		else
+		{
+			fps_u = (unsigned long)((fps_val <= 0 || fps_val > 60) ? 25 : fps_val);
+			smpte_num = fps_u * (unsigned long)tpf;
+			smpte_den = 1UL;
+			printf("MIDI Format: %d, Tracks: %d, SMPTE: %lu FPS, %d ticks/frame (%lu Hz)\n",
+				format, ntrks, fps_u, tpf, smpte_num);
+		}
 	}
 	else
 	{
 		printf("MIDI Format: %d, Tracks: %d, Division (TPQN): %d\n", format, ntrks, division);
 	}
+
 	if (slim_mode)
 	{
 		printf("Slim mode ON: stripping Aftertouch & duplicate CCs (keeping Pitch Bend)\n");
@@ -1688,7 +1714,7 @@ void convert_mid_to_xmi(unsigned char *midi_data, long fsize, const char *in_fil
 
 	// Execute modular 4-stage MIDI -> XMI conversion pipeline
 	events = mid_parse_and_merge_tracks(cur, end, ntrks, &ev_count, timbres, &timb_count);
-	mid_quantize_to_xmi_ticks(events, ev_count, is_smpte, smpte_ticks_per_sec, division, quant_hz);
+	mid_quantize_to_xmi_ticks(events, ev_count, is_smpte, smpte_num, smpte_den, division, quant_hz);
 	mid_pair_note_durations(events, ev_count);
 	mid_build_and_save_xmi(events, ev_count, fsize, target_path, timbres, timb_count,
 		slim_mode, quant_hz, slice_max_bytes);
@@ -1699,7 +1725,9 @@ void convert_mid_to_xmi(unsigned char *midi_data, long fsize, const char *in_fil
 // 7. File Merging Engine (-merge & -mergename)
 //==============================================================================
 
-#ifdef _WIN32
+#ifdef __WATCOMC__
+#include <dos.h>
+#elif defined(_WIN32)
 #include <io.h>
 #else
 #include <dirent.h>
@@ -1858,12 +1886,14 @@ static struct RawMidiEvent *load_as_xmi_events(const char *path, long *out_fsize
 	unsigned short *timbres, size_t *timb_count,
 	unsigned int quant_hz)
 {
+	int is_smpte = 0, fps_val;
 	long fsize = 0;
-	unsigned char *data = load_file_to_buffer(path, &fsize);
+	unsigned int hdr_len, lEVNT = 0, dlen, bs_dlen;
+	unsigned short ntrks, division;
+	unsigned long max_tick = 0, end_tick, smpte_num = 0, smpte_den = 1, fps_u;
+	unsigned char *data = load_file_to_buffer(path, &fsize), *cur, *evnt_start, *midi_decode, *copy, hi, tpf;
+	size_t ev_count = 0, i;
 	struct RawMidiEvent *events = NULL;
-	size_t ev_count = 0;
-	unsigned long max_tick = 0;
-	size_t i;
 
 	if (!data)
 	{
@@ -1875,12 +1905,20 @@ static struct RawMidiEvent *load_as_xmi_events(const char *path, long *out_fsize
 	if (fsize >= 4 && memcmp(data, "MThd", 4) == 0)
 	{
 		// Standard MIDI input: parse header, merge tracks, quantize to 120Hz, pair notes
-		unsigned char *cur = data + 4;
-		unsigned int hdr_len = _byteswap_ulong(*(unsigned int *)cur);
-		unsigned short ntrks, division;
-		int is_smpte = 0;
-		double smpte_hz = 0.0;
+		// Parse MThd header (pointer dereferences ensure big-endian 16-bit reads)
+		// "Pointer stars" must be placed like this otherwise TEMPO gets SUPER FAST!
+		//cur += 4;
+		//hdr_len = _byteswap_ulong(*(unsigned int *)cur);
+		//cur += 4;
+		//format = _byteswap_ushort(*(unsigned short *)cur);
+		//cur += 2;
+		//ntrks = _byteswap_ushort(*(unsigned short *)cur);
+		//cur += 2;
+		//division = _byteswap_ushort(*(unsigned short *)cur);
+		//cur += 2;
 
+		cur = data + 4;
+		hdr_len = _byteswap_ulong(*(unsigned int *)cur);
 		cur += 6;
 		ntrks = _byteswap_ushort(*(unsigned short *)cur);
 		cur += 2;
@@ -1893,27 +1931,36 @@ static struct RawMidiEvent *load_as_xmi_events(const char *path, long *out_fsize
 
 		if (division & 0x8000)
 		{
-			unsigned char hi = (unsigned char)((division >> 8) & 0xFF);
-			int fps_val = (hi >= 0xE0) ? -(signed char)hi : (hi & 0x7F);
-			unsigned char tpf = (unsigned char)(division & 0xFF);
-			double fps = (fps_val == 29) ? 29.97 : (double)((fps_val <= 0 || fps_val > 60) ? 25 : fps_val);
-			if (tpf == 0) tpf = 40;
+			hi = (unsigned char)((division >> 8) & 0xFF);
+			fps_val = (hi >= 0xE0) ? -(signed char)hi : (hi & 0x7F);
+			tpf = (unsigned char)(division & 0xFF);
 			is_smpte = 1;
-			smpte_hz = fps * (double)tpf;
+			if (tpf == 0)
+			{
+				tpf = 40;
+			}
+			if (fps_val == 29)
+			{
+				smpte_num = 30000UL * (unsigned long)tpf;
+				smpte_den = 1001UL;
+			}
+			else
+			{
+				fps_u = (unsigned long)((fps_val <= 0 || fps_val > 60) ? 25 : fps_val);
+				smpte_num = fps_u * (unsigned long)tpf;
+				smpte_den = 1UL;
+			}
 		}
 
 		events = mid_parse_and_merge_tracks(cur, data + fsize, ntrks, &ev_count, timbres, timb_count);
-		mid_quantize_to_xmi_ticks(events, ev_count, is_smpte, smpte_hz, division, quant_hz);
+		mid_quantize_to_xmi_ticks(events, ev_count, is_smpte, smpte_num, smpte_den, division, quant_hz);
 		mid_pair_note_durations(events, ev_count);
 	}
 	else if (fsize >= 4 && memcmp(data, "FORM", 4) == 0)
 	{
 		// XMIDI input: decode to 60PPQN MIDI in memory, wrap in MTrk header, and parse events
-		unsigned int lEVNT = 0;
-		unsigned char *evnt_start = xmi_locate_evnt_chunk(data, &lEVNT);
-		unsigned char *midi_decode = (unsigned char *)malloc((size_t)fsize * 4 + 4104);
-		unsigned int dlen;
-		unsigned int bs_dlen;
+		evnt_start = xmi_locate_evnt_chunk(data, &lEVNT);
+		midi_decode = (unsigned char *)malloc((size_t)fsize * 4 + 4104);
 
 		if (!midi_decode)
 		{
@@ -1928,8 +1975,10 @@ static struct RawMidiEvent *load_as_xmi_events(const char *path, long *out_fsize
 		bs_dlen = _byteswap_ulong(dlen);
 		memcpy(midi_decode + 4, &bs_dlen, 4);
 
-		events = mid_parse_and_merge_tracks(midi_decode, midi_decode + 8 + dlen, 1, &ev_count, timbres, timb_count);
-		mid_quantize_to_xmi_ticks(events, ev_count, 0, 0.0, DEFAULT_TIMEBASE, quant_hz);
+		events = 
+		mid_parse_and_merge_tracks(midi_decode, midi_decode + 8 + dlen, 1, &ev_count, timbres, timb_count);
+
+		mid_quantize_to_xmi_ticks(events, ev_count, 0, 0UL, 1UL, DEFAULT_TIMEBASE, quant_hz);
 		mid_pair_note_durations(events, ev_count);
 
 		free(midi_decode);
@@ -1944,7 +1993,7 @@ static struct RawMidiEvent *load_as_xmi_events(const char *path, long *out_fsize
 	// Calculate total span of this file (including trailing note durations)
 	for (i = 0; i < ev_count; i++)
 	{
-		unsigned long end_tick = events[i].abs_tick;
+		end_tick = events[i].abs_tick;
 		if (!events[i].skip && (events[i].status & 0xF0) == 0x90)
 		{
 			end_tick += events[i].duration_ticks;
@@ -1955,12 +2004,12 @@ static struct RawMidiEvent *load_as_xmi_events(const char *path, long *out_fsize
 		}
 	}
 
-	// Note: Keep 'data' alive if meta_data pointers point into it, or duplicate meta_data
+	// Duplicate meta_data payloads before freeing raw file buffer
 	for (i = 0; i < ev_count; i++)
 	{
 		if (events[i].meta_len > 0 && events[i].meta_data != NULL)
 		{
-			unsigned char *copy = (unsigned char *)malloc(events[i].meta_len);
+			copy = (unsigned char *)malloc(events[i].meta_len);
 			if (copy)
 			{
 				memcpy(copy, events[i].meta_data, events[i].meta_len);
@@ -2126,7 +2175,36 @@ void merge_directory_by_root(const char *root_prefix, const char *out_filename,
 	int used[MAX_MERGE_FILES];
 	int i, j;
 	memset(used, 0, sizeof(used));
-#ifdef _WIN32
+#ifdef __WATCOMC__
+	{
+		struct find_t fd;
+		unsigned rc;
+		char r_buf[PATH_BUF_SIZE], e_buf[SUFFIX_BUF_SIZE];
+		int matched;
+
+		rc = _dos_findfirst("*.*", _A_NORMAL | _A_ARCH | _A_RDONLY, &fd);
+		while (rc == 0 && total_found < MAX_MERGE_FILES)
+		{
+			matched = 0;
+			if (root_prefix)
+			{
+				matched = matches_explicit_root(fd.name, root_prefix, e_buf, sizeof(e_buf));
+			}
+			else
+			{
+				matched = extract_slice_root(fd.name, r_buf, sizeof(r_buf), e_buf, sizeof(e_buf));
+			}
+
+			if (matched)
+			{
+				all_files[total_found] = _strdup(fd.name);
+				total_found++;
+			}
+			rc = _dos_findnext(&fd);
+		}
+		_dos_findclose(&fd);
+	}
+#elif defined(_WIN32)
 	{
 		struct _finddata_t fd;
 		intptr_t hFind = _findfirst("*.*", &fd);
@@ -2174,16 +2252,16 @@ void merge_directory_by_root(const char *root_prefix, const char *out_filename,
 
 				if (root_prefix)
 				{
-					matched = matches_explicit_root(fd.name, root_prefix, e_buf, sizeof(e_buf));
+					matched = matches_explicit_root(ent->d_name, root_prefix, e_buf, sizeof(e_buf));
 				}
 				else
 				{
-					matched = extract_slice_root(fd.name, r_buf, sizeof(r_buf), e_buf, sizeof(e_buf));
+					matched = extract_slice_root(ent->d_name, r_buf, sizeof(r_buf), e_buf, sizeof(e_buf));
 				}
 
 				if (matched)
 				{
-					all_files[total_found] = _strdup(fd.name);
+					all_files[total_found] = _strdup(ent->d_name);
 					total_found++;
 				}
 			}
@@ -2396,6 +2474,7 @@ int main(int argc, char **argv)
 
 	if (!in_file)
 	{
+		printf("by Darkcrafter07, darkcrafter774@gmail.com\n");
 		printf("XMI2MID07 - Bidirectional MIDI <-> XMIDI Converter, Slicer & Merger\n\n");
 		printf("Usage:\n");
 		printf("  %s <infile> [outfile] [-slim] [-q:Hz] [-slice <bytes>]\n", *argv);
@@ -2471,6 +2550,5 @@ int main(int argc, char **argv)
 
 	return 0;
 }
-
 
 

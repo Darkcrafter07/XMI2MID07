@@ -1,0 +1,11 @@
+# MAKEFILE for XMI2MID.EXE (Watcom C/C++ 32-bit v11.0c, DOS/4GW)
+prod = /3r /s /otexan /zq
+compileoptions = $(prod)
+
+xmi2mid.exe : xmi2mid.obj
+	wlink @makefile.lnk
+
+xmi2mid.obj : xmi2mid.c xmi2mid.h
+	wcc386 xmi2mid.c $(compileoptions)
+
+

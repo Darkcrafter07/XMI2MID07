@@ -32,14 +32,35 @@
 #include <errno.h>
 
 //------------------------------------------------------------------------------
-// Cross-platform compatibility macros (MSVC vs GCC/Clang on Linux/macOS)
+// Watcom C11.0 (1996) compiler
 //------------------------------------------------------------------------------
-#ifndef _WIN32
-    #define _byteswap_ulong __builtin_bswap32
-    #define _byteswap_ushort __builtin_bswap16
-    #define _stricmp strcasecmp
-    #define fopen_s(fp, name, mode) ((*(fp) = fopen((name), (mode))) == NULL ? errno : 0)
-    #define fread_s(buf, bsz, esz, cnt, fp) fread((buf), (esz), (cnt), (fp))
+#ifdef __WATCOMC__
+#include <io.h>
+#include <direct.h>
+static unsigned long watcom_bswap32(unsigned long x)
+{
+    return ((x & 0x000000FFUL) << 24) |
+           ((x & 0x0000FF00UL) << 8)  |
+           ((x & 0x00FF0000UL) >> 8)  |
+           ((x & 0xFF000000UL) >> 24);
+}
+static unsigned short watcom_bswap16(unsigned short x)
+{
+    return (unsigned short)(((x & 0x00FFU) << 8) | ((x & 0xFF00U) >> 8));
+}
+#define _byteswap_ulong(x)  watcom_bswap32((unsigned long)(x))
+#define _byteswap_ushort(x) watcom_bswap16((unsigned short)(x))
+#define _stricmp stricmp
+#define _strnicmp strnicmp
+#define _strdup strdup
+#define fopen_s(fp, name, mode) ((*(fp) = fopen((name), (mode))) == NULL ? errno : 0)
+#define fread_s(buf, bsz, esz, cnt, fp) fread((buf), (esz), (cnt), (fp))
+#elif !defined(_WIN32)
+#define _byteswap_ulong __builtin_bswap32
+#define _byteswap_ushort __builtin_bswap16
+#define _stricmp strcasecmp
+#define fopen_s(fp, name, mode) ((*(fp) = fopen((name), (mode))) == NULL ? errno : 0)
+#define fread_s(buf, bsz, esz, cnt, fp) fread((buf), (esz), (cnt), (fp))
 #endif
 
 //------------------------------------------------------------------------------
@@ -105,8 +126,8 @@ struct ChannelState
     unsigned char rpn_lsb[MAX_CHANNELS];    // Last RPN LSB (CC 100)
     unsigned char rpn_range[MAX_CHANNELS];  // Pitch Bend sensitivity in semitones (RPN 0,0 -> CC 6)
     unsigned char has_rpn[MAX_CHANNELS];    // Flag: 1 if custom Pitch Bend range was set
-	unsigned char active_vel[MAX_CHANNELS][MAX_NOTES];    // To chop played notes
-	unsigned long note_end_tick[MAX_CHANNELS][MAX_NOTES]; // To chop played notes
+    unsigned char active_vel[MAX_CHANNELS][MAX_NOTES];    // To chop played notes
+    unsigned long note_end_tick[MAX_CHANNELS][MAX_NOTES]; // To chop played notes
 };
 
 //------------------------------------------------------------------------------

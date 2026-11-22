@@ -1,0 +1,9 @@
+system dos4g
+option map
+option stack=128k
+option stub=stub32c.exe
+option stub=dos32a.exe
+name xmi2mid.exe
+file xmi2mid.obj
+
+
